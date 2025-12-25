@@ -1,0 +1,329 @@
+<#
+.SYNOPSIS
+    Collects UEFI security posture details on Windows devices.
+
+.DESCRIPTION
+    This script inspects Secure Boot, TPM, Hypervisor Code Integrity (HVCI), virtualization-based security (VBS),
+    and gathers firmware context such as BIOS details and selected NVRAM variables. The script is read-only and
+    intended to help detect weakened UEFI protections or indicators of potential bypass attempts.
+
+.PARAMETER OutputPath
+    Optional path to write a JSON report with all collected fields.
+
+.PARAMETER IncludeFirmwareTables
+    When set, attempts to retrieve ACPI/SMBIOS firmware tables for offline review.
+
+.PARAMETER IncludeNvramDump
+    When set, attempts to read additional UEFI NVRAM variables (BootOrder, BootNext, BootCurrent, SecureBoot).
+
+.NOTES
+    Administrator privileges are recommended for the most complete results (Secure Boot queries require UEFI).
+    The script performs only read operations and is designed to be safe to run on production endpoints.
+#>
+param(
+    [string]$OutputPath,
+    [switch]$IncludeFirmwareTables,
+    [switch]$IncludeNvramDump
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+function Test-Administrator {
+    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Get-SecureBootStatus {
+    try {
+        $supported = Confirm-SecureBootUEFI -ErrorAction Stop
+        return [PSCustomObject]@{
+            Supported      = $true
+            Enabled        = [bool]$supported
+            Notes          = if ($supported) { 'Secure Boot reported as enabled.' } else { 'Secure Boot supported but reported as disabled.' }
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Supported      = $false
+            Enabled        = $false
+            Notes          = 'Secure Boot not available or UEFI interface blocked. Requires native UEFI environment and administrator privileges.'
+        }
+    }
+}
+
+function Get-DeviceGuardStatus {
+    try {
+        $dg = Get-CimInstance -ClassName Win32_DeviceGuard
+        $hvciState = switch ($dg.HypervisorEnforcedCodeIntegrity) {
+            0 { 'Off' }
+            1 { 'On' }
+            2 { 'Audit' }
+            default { 'Unknown' }
+        }
+
+        $vbsConfigured = $dg.SecurityServicesConfigured -contains 1
+        $vbsRunning = $dg.SecurityServicesRunning -contains 1
+
+        return [PSCustomObject]@{
+            VBSConfigured = $vbsConfigured
+            VBSRunning    = $vbsRunning
+            HVCI          = $hvciState
+            CredentialGuardConfigured = $dg.SecurityServicesConfigured -contains 2
+            CredentialGuardRunning    = $dg.SecurityServicesRunning -contains 2
+            Notes         = 'Device Guard information collected.'
+        }
+    } catch {
+        return [PSCustomObject]@{
+            VBSConfigured = $false
+            VBSRunning    = $false
+            HVCI          = 'Unknown'
+            CredentialGuardConfigured = $false
+            CredentialGuardRunning    = $false
+            Notes         = 'Unable to query Device Guard (possible OS version mismatch or insufficient privileges).'
+        }
+    }
+}
+
+function Get-HvciRegistryStatus {
+    $path = 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity'
+    if (-not (Test-Path $path)) {
+        return [PSCustomObject]@{
+            Exists  = $false
+            Enabled = 'Unknown'
+            Notes   = 'HVCI registry scenario not present.'
+        }
+    }
+
+    $value = Get-ItemProperty -Path $path -Name Enabled -ErrorAction SilentlyContinue
+    $enabledValue = $value.Enabled
+    $state = switch ($enabledValue) {
+        0 { 'Disabled' }
+        1 { 'Enabled' }
+        2 { 'Audit' }
+        default { 'Unknown' }
+    }
+
+    return [PSCustomObject]@{
+        Exists  = $true
+        Enabled = $state
+        Notes   = 'HVCI registry policy captured.'
+    }
+}
+
+function Get-TpmStatus {
+    try {
+        $tpm = Get-Tpm
+        return [PSCustomObject]@{
+            Present         = $tpm.TpmPresent
+            Ready           = $tpm.TpmReady
+            Enabled         = $tpm.TpmEnabled
+            Activated       = $tpm.TpmActivated
+            Owned           = $tpm.TpmOwned
+            ManufacturerId  = $tpm.ManufacturerIdTxt
+            SpecVersion     = ($tpm.SpecVersion -join ', ')
+            Notes           = 'TPM status collected via Get-Tpm.'
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Present         = $false
+            Ready           = $false
+            Enabled         = $false
+            Activated       = $false
+            Owned           = $false
+            ManufacturerId  = ''
+            SpecVersion     = ''
+            Notes           = 'Unable to query TPM (unsupported platform or insufficient privileges).'
+        }
+    }
+}
+
+function Get-FirmwareInventory {
+    $bios = Get-CimInstance -ClassName Win32_BIOS
+    $board = Get-CimInstance -ClassName Win32_BaseBoard
+    return [PSCustomObject]@{
+        BiosVendor      = $bios.Manufacturer
+        BiosVersion     = $bios.SMBIOSBIOSVersion
+        BiosReleaseDate = $bios.ReleaseDate
+        BaseBoard       = $board.Product
+        BaseBoardVendor = $board.Manufacturer
+    }
+}
+
+function Get-FirmwareTableSummary {
+    param(
+        [switch]$Enabled
+    )
+
+    if (-not $Enabled) {
+        return @()
+    }
+
+    try {
+        return Get-CimInstance -ClassName MS_SystemFirmwareTable | ForEach-Object {
+            [PSCustomObject]@{
+                TableProvider = $_.TableProvider
+                TableID       = $_.TableID
+                Key           = $_.Key
+                Description   = 'Firmware table metadata captured for offline review.'
+            }
+        }
+    } catch {
+        return @([PSCustomObject]@{
+            TableProvider = ''
+            TableID       = ''
+            Key           = ''
+            Description   = 'Unable to read firmware tables.'
+        })
+    }
+}
+
+function Get-NvramSummary {
+    param(
+        [switch]$Enabled
+    )
+
+    if (-not $Enabled) {
+        return [PSCustomObject]@{
+            Collected = $false
+            SecureBootVar = ''
+            BootOrder     = ''
+            BootCurrent   = ''
+            BootNext      = ''
+            Notes         = 'NVRAM collection skipped.'
+        }
+    }
+
+    $guid = '{8be4df61-93ca-11d2-aa0d-00e098032b8c}'
+    $nvram = @{
+        SecureBoot = ''
+        BootOrder  = ''
+        BootCurrent = ''
+        BootNext   = ''
+    }
+
+    foreach ($name in $nvram.Keys) {
+        try {
+            $data = Get-FirmwareEnvironmentVariable -Name $name -Namespace $guid
+            if ($data -is [byte[]]) {
+                $nvram[$name] = ($data | ForEach-Object { $_.ToString('X2') }) -join ' '
+            } else {
+                $nvram[$name] = [string]$data
+            }
+        } catch {
+            $nvram[$name] = 'Unavailable'
+        }
+    }
+
+    return [PSCustomObject]@{
+        Collected    = $true
+        SecureBootVar= $nvram.SecureBoot
+        BootOrder    = $nvram.BootOrder
+        BootCurrent  = $nvram.BootCurrent
+        BootNext     = $nvram.BootNext
+        Notes        = 'NVRAM variables captured via Get-FirmwareEnvironmentVariable.'
+    }
+}
+
+function Get-BootEntries {
+    try {
+        $bcdOutput = bcdedit /enum firmware
+        return [PSCustomObject]@{
+            Collected = $true
+            Entries   = $bcdOutput -join [Environment]::NewLine
+            Notes     = 'Firmware boot entries enumerated via bcdedit.'
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Collected = $false
+            Entries   = ''
+            Notes     = 'Unable to enumerate firmware boot entries.'
+        }
+    }
+}
+
+function Write-Section {
+    param(
+        [string]$Title
+    )
+    Write-Host ''
+    Write-Host ('=' * 70) -ForegroundColor DarkGray
+    Write-Host $Title -ForegroundColor Cyan
+    Write-Host ('=' * 70) -ForegroundColor DarkGray
+}
+
+$admin = Test-Administrator
+# Self-elevate if not running as Administrator
+if (-not $admin) {
+    Write-Host 'Elevation required. Relaunching with Administrator privileges...' -ForegroundColor Yellow
+    $quotedPath = '"' + $PSCommandPath + '"'
+    $argList = "-ExecutionPolicy Bypass -File $quotedPath"
+    if ($OutputPath) { $argList += " -OutputPath `"$OutputPath`"" }
+    if ($IncludeFirmwareTables) { $argList += " -IncludeFirmwareTables" }
+    if ($IncludeNvramDump) { $argList += " -IncludeNvramDump" }
+    Start-Process -FilePath "powershell" -Verb RunAs -ArgumentList $argList
+    exit
+}
+
+Write-Host "Running as administrator: $admin" -ForegroundColor Yellow
+
+$secureBoot = Get-SecureBootStatus
+$deviceGuard = Get-DeviceGuardStatus
+$hvciRegistry = Get-HvciRegistryStatus
+$tpm = Get-TpmStatus
+$firmware = Get-FirmwareInventory
+$nvram = Get-NvramSummary -Enabled:$IncludeNvramDump
+$bootEntries = Get-BootEntries
+$firmwareTables = Get-FirmwareTableSummary -Enabled:$IncludeFirmwareTables
+
+# Console report
+Write-Section -Title 'Secure Boot'
+$secureBoot | Format-List
+
+Write-Section -Title 'Virtualization-Based Security'
+$deviceGuard | Format-List
+$hvciRegistry | Format-List
+
+Write-Section -Title 'TPM'
+$tpm | Format-List
+
+Write-Section -Title 'Firmware Inventory'
+$firmware | Format-List
+
+Write-Section -Title 'NVRAM Snapshot'
+$nvram | Format-List
+
+Write-Section -Title 'Boot Entries'
+$bootEntries | Format-List
+
+if ($IncludeFirmwareTables) {
+    Write-Section -Title 'Firmware Tables'
+    $firmwareTables | Format-List
+}
+
+$report = [PSCustomObject]@{
+    Timestamp        = (Get-Date).ToString('s')
+    IsAdministrator  = $admin
+    SecureBoot       = $secureBoot
+    DeviceGuard      = $deviceGuard
+    HvciRegistry     = $hvciRegistry
+    TPM              = $tpm
+    Firmware         = $firmware
+    Nvram            = $nvram
+    BootEntries      = $bootEntries
+    FirmwareTables   = $firmwareTables
+}
+
+if ($OutputPath) {
+    try {
+        $json = $report | ConvertTo-Json -Depth 6
+        $parent = Split-Path -Path $OutputPath -Parent
+        if ($parent -and -not (Test-Path $parent)) {
+            New-Item -Path $parent -ItemType Directory -Force | Out-Null
+        }
+        $json | Out-File -FilePath $OutputPath -Encoding utf8
+        Write-Host "Report written to $OutputPath" -ForegroundColor Green
+    } catch {
+        Write-Warning "Failed to write report: $($_.Exception.Message)"
+    }
+}
